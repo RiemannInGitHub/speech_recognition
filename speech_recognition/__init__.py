@@ -1,3 +1,4 @@
+#encoding=utf-8
 #!/usr/bin/env python3
 
 """Library for performing speech recognition, with support for several engines and APIs, online and offline."""
@@ -430,7 +431,7 @@ class AudioData(object):
             startup_info.wShowWindow = subprocess.SW_HIDE  # specify that the console window should be hidden
         else:
             startup_info = None  # default startupinfo
-        process = subprocess.Popen([
+        process = subprocess.Popen([#TODO:opus的格式是不是也可以这样搞？
             flac_converter,
             "--stdout", "--totally-silent",  # put the resulting FLAC file in stdout, and make sure it's not mixed with any program output
             "--best",  # highest level of compression available
@@ -449,7 +450,8 @@ class Recognizer(AudioSource):
         self.dynamic_energy_threshold = True
         self.dynamic_energy_adjustment_damping = 0.15
         self.dynamic_energy_ratio = 1.5
-        self.pause_threshold = 0.8  # seconds of non-speaking audio before a phrase is considered complete
+        self.pause_threshold = 0.8  # seconds of non-speaking audio before a phrase is considered complete#根据静音段的时长判断是否已经停止说话。
+        self.slice_threshold = 0.4#中间切分处的静音时长阈值
         self.operation_timeout = None  # seconds after an internal operation (e.g., an API request) starts before it times out, or ``None`` for no timeout
 
         self.phrase_threshold = 0.3  # minimum seconds of speaking audio before we consider the speaking audio a phrase - values below this are ignored (for filtering out clicks and pops)
@@ -542,6 +544,7 @@ class Recognizer(AudioSource):
         while True:
             frames = collections.deque()
 
+            #这部分处理静音
             # store audio input until the phrase starts
             while True:
                 # handle waiting too long for phrase by raising an exception
@@ -552,7 +555,7 @@ class Recognizer(AudioSource):
                 buffer = source.stream.read(source.CHUNK)
                 if len(buffer) == 0: break  # reached end of the stream
                 frames.append(buffer)
-                if len(frames) > non_speaking_buffer_count:  # ensure we only keep the needed amount of non-speaking buffers
+                if len(frames) > non_speaking_buffer_count:  # ensure we only keep the needed amount of non-speaking buffers#控制开头的静音段不要太长
                     frames.popleft()
 
                 # detect whether speaking has started on audio input
@@ -565,6 +568,7 @@ class Recognizer(AudioSource):
                     target_energy = energy * self.dynamic_energy_ratio
                     self.energy_threshold = self.energy_threshold * damping + target_energy * (1 - damping)
 
+            #这部分处理非静音
             # read audio input until the phrase ends
             pause_count, phrase_count = 0, 0
             phrase_start_time = elapsed_time
@@ -582,21 +586,112 @@ class Recognizer(AudioSource):
                 # check if speaking has stopped for longer than the pause threshold on the audio input
                 energy = audioop.rms(buffer, source.SAMPLE_WIDTH)  # unit energy of the audio signal within the buffer
                 if energy > self.energy_threshold:
-                    pause_count = 0
+                    pause_count = 0#一旦出现语音随即重新归零
                 else:
                     pause_count += 1
-                if pause_count > pause_buffer_count:  # end of the phrase
+                if pause_count > pause_buffer_count:  # end of the phrase#静音足够长，认为不再说话
                     break
 
             # check how long the detected phrase is, and retry listening if the phrase is too short
             phrase_count -= pause_count  # exclude the buffers for the pause before the phrase
-            if phrase_count >= phrase_buffer_count or len(buffer) == 0: break  # phrase is long enough or we've reached the end of the stream, so stop listening
+            if phrase_count >= phrase_buffer_count or len(buffer) == 0: break  # phrase is long enough or we've reached the end of the stream, so stop listening#采集到的说话片段要足够长，滤除突变噪音
 
         # obtain frame data
         for i in range(pause_count - non_speaking_buffer_count): frames.pop()  # remove extra non-speaking frames at the end
         frame_data = b"".join(list(frames))
 
         return AudioData(frame_data, source.SAMPLE_RATE, source.SAMPLE_WIDTH)
+
+    def listen_and_slice_and_recognize(self, source, timeout=None, phrase_time_limit=None):
+        """
+        根据静音的长短，较短的静音进行切割，分别去识别，一直到较长的静音出现，停止识别
+        """
+        assert isinstance(source, AudioSource), "Source must be an audio source"
+        assert source.stream is not None, "Audio source must be entered before listening, see documentation for ``AudioSource``; are you using ``source`` outside of a ``with`` statement?"
+        assert self.pause_threshold >= self.non_speaking_duration >= 0
+        assert self.pause_threshold > self.slice_threshold > 0
+
+        seconds_per_buffer = (source.CHUNK + 0.0) / source.SAMPLE_RATE
+        pause_buffer_count = int(math.ceil(self.pause_threshold / seconds_per_buffer))  # number of buffers of non-speaking audio during a phrase, before the phrase should be considered complete
+        phrase_buffer_count = int(math.ceil(self.phrase_threshold / seconds_per_buffer))  # minimum number of buffers of speaking audio before we consider the speaking audio a phrase
+        non_speaking_buffer_count = int(math.ceil(self.non_speaking_duration / seconds_per_buffer))  # maximum number of buffers of non-speaking audio to retain before and after a phrase
+
+        slice_buffer_count =int(math.ceil(self.slice_threshold/seconds_per_buffer))
+
+        # read audio input for phrases until there is a phrase that is long enough
+        elapsed_time = 0  # number of seconds of audio read
+        buffer = b""  # an empty buffer means that the stream has ended and there is no data left to read
+        #逻辑的设计：开始静音处理加语音段，切分发送进行识别；然后继续录制切分发送识别，静音长度达到结束阈值，停止识别。
+        #需注意切分段静音和结束段静音的包含关系
+
+        frames = collections.deque()
+        #这部分处理静音
+        # store audio input until the phrase starts
+        while True:
+            # handle waiting too long for phrase by raising an exception
+            elapsed_time += seconds_per_buffer
+            if timeout and elapsed_time > timeout:
+                raise WaitTimeoutError("listening timed out while waiting for phrase to start")
+
+            buffer = source.stream.read(source.CHUNK)
+            if len(buffer) == 0: break  # reached end of the stream
+            frames.append(buffer)
+            if len(frames) > non_speaking_buffer_count:  # ensure we only keep the needed amount of non-speaking buffers#控制开头的静音段不要太长
+                frames.popleft()
+
+            # detect whether speaking has started on audio input
+            energy = audioop.rms(buffer, source.SAMPLE_WIDTH)  # energy of the audio signal
+            if energy > self.energy_threshold: break
+
+            # dynamically adjust the energy threshold using asymmetric weighted average
+            if self.dynamic_energy_threshold:
+                damping = self.dynamic_energy_adjustment_damping ** seconds_per_buffer  # account for different chunk sizes and rates
+                target_energy = energy * self.dynamic_energy_ratio
+                self.energy_threshold = self.energy_threshold * damping + target_energy * (1 - damping)
+
+        #这部分处理非静音
+        # read audio input until the phrase ends
+        pause_count, phrase_count = 0, 0
+        phrase_start_time = elapsed_time
+        sent_flag = False #标识一段数据是否已经被发送识别
+        while True:
+            # handle phrase being too long by cutting off the audio
+            elapsed_time += seconds_per_buffer
+            if phrase_time_limit and elapsed_time - phrase_start_time > phrase_time_limit:
+                break
+
+            buffer = source.stream.read(source.CHUNK)
+            if len(buffer) == 0: break  # reached end of the stream
+            frames.append(buffer)
+            phrase_count += 1
+
+            # check if speaking has stopped for longer than the pause threshold on the audio input
+            energy = audioop.rms(buffer, source.SAMPLE_WIDTH)  # unit energy of the audio signal within the buffer
+            if energy > self.energy_threshold:
+                pause_count = 0#一旦出现语音随即重新归零
+                sent_flag = False
+            else:
+                pause_count += 1
+
+            if pause_count > slice_buffer_count and not sent_flag:  # end of the phrase#静音足够长，认为不再说话，并且此部分数据并未被发送识别
+                for i in range( pause_count - non_speaking_buffer_count): frames.pop()  # remove extra non-speaking frames at the end
+                frame_data = b"".join(list(frames))
+                recognize_thread = threading.Thread(target=self.recognize_baidu(AudioData(frame_data, source.SAMPLE_RATE, source.SAMPLE_WIDTH)))
+                recognize_thread.daemon = True
+                recognize_thread.start()
+                frames = collections.deque()
+                sent_flag = True
+
+            if pause_count > pause_buffer_count: break
+
+
+            # check how long the detected phrase is, and retry listening if the phrase is too short
+            # phrase_count -= pause_count  # exclude the buffers for the pause before the phrase
+            # if phrase_count >= phrase_buffer_count or len(buffer) == 0: break  # phrase is long enough or we've reached the end of the stream, so stop listening#采集到的说话片段要足够长，滤除突变噪音
+
+
+        # obtain frame data
+
 
     def listen_in_background(self, source, callback, phrase_time_limit=None):
         """
@@ -630,7 +725,7 @@ class Recognizer(AudioSource):
         listener_thread.start()
         return stopper
 
-    def recognize_sphinx(self, audio_data, language="en-US", keyword_entries=None, show_all=False):
+    def recognize_sphinx(self, audio_data, language="zh-CN", keyword_entries=None, show_all=False):
         """
         Performs speech recognition on ``audio_data`` (an ``AudioData`` instance), using CMU Sphinx.
 
@@ -702,6 +797,77 @@ class Recognizer(AudioSource):
         hypothesis = decoder.hyp()
         if hypothesis is not None: return hypothesis.hypstr
         raise UnknownValueError()  # no transcriptions available
+
+    def recognize_baidu(self, audio_data, key=None, language="zh-CN", show_all=True):
+        """
+        百度语音识别API，
+        :param audio_data:
+        :param key:
+        :param language:语种选择，中文=zh、粤语=ct、英文=en，不区分大小写，默认中文
+        :param show_all:
+        :return:
+        """
+        #TODO:listen时，百度识别的问题："黑色的天窗"识别不准、长语音不准、静音或音量不大会出现recognition error、说话不能随意只能清楚的发音；解决健壮性的问题
+        #TODO：异步识别
+        #TODO:添加try except
+        assert isinstance(audio_data, AudioData), "Data must be audio data"
+
+        import urllib2
+        import pycurl
+
+        def get_token():
+            apiKey = "0XyzNfIwZeSqDN8oZWR54Qon"
+            secretKey = "92971d401d3df1bd2869afebc04df63b"
+
+            auth_url = "https://openapi.baidu.com/oauth/2.0/token?grant_type=client_credentials" + \
+                       "&client_id=" + apiKey + "&client_secret=" + secretKey
+
+            res = urllib2.urlopen(auth_url)
+            json_data = res.read()
+            return json.loads(json_data)['access_token']
+
+        global baidu_text
+        def dump_res(buf):
+            global baidu_text
+            a = eval(buf)
+            if a['err_msg'] == 'success.':
+                # print a['result'][0]#终于搞定了，在这里可以输出，返回的语句
+                baidu_text = a['result'][0]
+            else:
+                baidu_text = a['err_msg'] if not show_all else a
+
+        wav_data = audio_data.get_wav_data(
+            convert_rate=16000,  # audio samples must be at least 8 kHz
+            convert_width=2  # audio samples should be 16-bit
+        )
+        audio_len = len(wav_data)
+        cuid = "38:c9:86:13:93:1f"  # my Mac MAC
+        token = get_token()
+        srv_url = 'http://vop.baidu.com/server_api' + '?cuid=' + cuid + '&token=' + token
+        http_header = [
+            'Content-Type: audio/wav;rate=16000',
+            'Content-Length: %d' % audio_len      ]
+
+        c = pycurl.Curl()
+        c.setopt(pycurl.URL, str(srv_url))  # curl doesn't support unicode
+        #c.setopt(c.RETURNTRANSFER, 1)
+        c.setopt(c.HTTPHEADER, http_header)  # must be list, not dict
+        c.setopt(c.POST, 1)
+        c.setopt(c.CONNECTTIMEOUT, 300)
+        c.setopt(c.TIMEOUT, 30)
+        c.setopt(c.WRITEFUNCTION, dump_res)
+        c.setopt(c.POSTFIELDS, wav_data)
+        c.setopt(c.POSTFIELDSIZE, audio_len)
+        # c.setopt(c.VERBOSE, True)
+        try:
+            c.perform()  # pycurl.perform() has no return val
+        except Exception,e:
+            raise Exception(":"+e.message)#not very good
+        finally:
+            c.close()
+
+        print baidu_text
+        # return baidu_text
 
     def recognize_google(self, audio_data, key=None, language="en-US", show_all=False):
         """
