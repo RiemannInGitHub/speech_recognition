@@ -70,7 +70,7 @@ class Microphone(AudioSource):
 
     Higher ``chunk_size`` values help avoid triggering on rapidly changing ambient noise, but also makes detection less sensitive. This value, generally, should be left at its default.
     """
-    def __init__(self, device_index=None, sample_rate=None, chunk_size=1024):
+    def __init__(self, device_index=None, sample_rate=16000, chunk_size=1024):
         assert device_index is None or isinstance(device_index, int), "Device index must be None or an integer"
         assert sample_rate is None or (isinstance(sample_rate, int) and sample_rate > 0), "Sample rate must be None or a positive integer"
         assert isinstance(chunk_size, int) and chunk_size > 0, "Chunk size must be a positive integer"
@@ -440,6 +440,42 @@ class AudioData(object):
         flac_data, stderr = process.communicate(wav_data)
         return flac_data
 
+    def get_opus_data(self,convert_rate=None, convert_width=None):
+        """
+        Returns a byte string representing the contents of a FLAC file containing the audio represented by the ``AudioData`` instance.
+
+        Note that 32-bit FLAC is not supported. If the audio data is 32-bit and ``convert_width`` is not specified, then the resulting FLAC will be a 24-bit FLAC.
+
+        If ``convert_rate`` is specified and the audio sample rate is not ``convert_rate`` Hz, the resulting audio is resampled to match.
+
+        If ``convert_width`` is specified and the audio samples are not ``convert_width`` bytes each, the resulting audio is converted to match.
+
+        Writing these bytes directly to a file results in a valid `FLAC file <https://en.wikipedia.org/wiki/FLAC>`__.
+        """
+        assert convert_width is None or (convert_width % 1 == 0 and 1 <= convert_width <= 3), "Sample width to convert to must be between 1 and 3 inclusive"
+
+        if self.sample_width > 3 and convert_width is None:  # resulting WAV data would be 32-bit, which is not convertable to FLAC using our encoder
+            convert_width = 3  # the largest supported sample width is 24-bit, so we'll limit the sample width to that
+
+        # run the FLAC converter with the WAV data to get the FLAC data
+        wav_data = self.get_wav_data(convert_rate, convert_width)
+        flac_converter = get_flac_converter()
+        if os.name == "nt":  # on Windows, specify that the process is to be started without showing a console window
+            startup_info = subprocess.STARTUPINFO()
+            startup_info.dwFlags |= subprocess.STARTF_USESHOWWINDOW  # specify that the wShowWindow field of `startup_info` contains a value
+            startup_info.wShowWindow = subprocess.SW_HIDE  # specify that the console window should be hidden
+        else:
+            startup_info = None  # default startupinfo
+        process = subprocess.Popen([#TODO:opus的格式是不是也可以这样搞？
+            flac_converter,
+            "--stdout", "--totally-silent",  # put the resulting FLAC file in stdout, and make sure it's not mixed with any program output
+            "--best",  # highest level of compression available
+            "-",  # the input FLAC file contents will be given in stdin
+        ], stdin=subprocess.PIPE, stdout=subprocess.PIPE, startupinfo=startup_info)
+        flac_data, stderr = process.communicate(wav_data)
+        return flac_data
+
+
 
 class Recognizer(AudioSource):
     def __init__(self):
@@ -450,8 +486,8 @@ class Recognizer(AudioSource):
         self.dynamic_energy_threshold = True
         self.dynamic_energy_adjustment_damping = 0.15
         self.dynamic_energy_ratio = 1.5
-        self.pause_threshold = 0.8  # seconds of non-speaking audio before a phrase is considered complete#根据静音段的时长判断是否已经停止说话。
-        self.slice_threshold = 0.4#中间切分处的静音时长阈值
+        self.pause_threshold = 5  # seconds of non-speaking audio before a phrase is considered complete#根据静音段的时长判断是否已经停止说话。
+        self.slice_threshold = 0.6#中间切分处的静音时长阈值
         self.operation_timeout = None  # seconds after an internal operation (e.g., an API request) starts before it times out, or ``None`` for no timeout
 
         self.phrase_threshold = 0.3  # minimum seconds of speaking audio before we consider the speaking audio a phrase - values below this are ignored (for filtering out clicks and pops)
@@ -466,7 +502,7 @@ class Recognizer(AudioSource):
         assert isinstance(source, AudioSource), "Source must be an audio source"
         assert source.stream is not None, "Audio source must be entered before recording, see documentation for ``AudioSource``; are you using ``source`` outside of a ``with`` statement?"
 
-        frames = io.BytesIO()
+        frames = io.BytesIO()#此处采用的是bytesIO，而不是list或者deque。
         seconds_per_buffer = (source.CHUNK + 0.0) / source.SAMPLE_RATE
         elapsed_time = 0
         offset_time = 0
@@ -652,8 +688,10 @@ class Recognizer(AudioSource):
         #这部分处理非静音
         # read audio input until the phrase ends
         pause_count, phrase_count = 0, 0
+        pause_count_this_time = 0
         phrase_start_time = elapsed_time
         sent_flag = False #标识一段数据是否已经被发送识别
+        wavname_index = 0
         while True:
             # handle phrase being too long by cutting off the audio
             elapsed_time += seconds_per_buffer
@@ -672,17 +710,32 @@ class Recognizer(AudioSource):
                 sent_flag = False
             else:
                 pause_count += 1
+                pause_count_this_time += 1
 
-            if pause_count > slice_buffer_count and not sent_flag:  # end of the phrase#静音足够长，认为不再说话，并且此部分数据并未被发送识别
-                for i in range( pause_count - non_speaking_buffer_count): frames.pop()  # remove extra non-speaking frames at the end
+            #TODO：通过麦克风录入识别不准的原因：1.信噪比低。说话声音小，环境噪音较大。在遇到都是噪音的嘈杂片段时，就会返回3301:recognition error.2.吐词不清晰
+            if pause_count > slice_buffer_count and not sent_flag and (phrase_count - pause_count_this_time >= phrase_buffer_count):  # end of the phrase#静音足够长，认为不再说话，并且此部分数据并未被发送识别
+                # for i in range( pause_count - non_speaking_buffer_count): frames.pop()  # remove extra non-speaking frames at the end
+                print '———————{}———————'.format(wavname_index)
+
                 frame_data = b"".join(list(frames))
-                recognize_thread = threading.Thread(target=self.recognize_baidu(AudioData(frame_data, source.SAMPLE_RATE, source.SAMPLE_WIDTH)))
-                recognize_thread.daemon = True
+                wavname = str(wavname_index)+'.wav'
+                f = wave.open(wavname,'w')
+                f.setframerate(16000)
+                f.setnchannels(1)
+                f.setsampwidth(2)
+                f.writeframes(frame_data)
+                recognize_thread = threading.Thread(target=self.recognize_baidu,args=(AudioData(frame_data, source.SAMPLE_RATE, source.SAMPLE_WIDTH),wavname_index,))
+                # recognize_thread.daemon = True
                 recognize_thread.start()
-                frames = collections.deque()
                 sent_flag = True
+                frames = collections.deque()
+                phrase_count = 0
+                pause_count_this_time = 0
+                wavname_index += 1
 
-            if pause_count > pause_buffer_count: break
+            if pause_count > pause_buffer_count:
+                print pause_count, "结束识别",pause_buffer_count
+                break
 
 
             # check how long the detected phrase is, and retry listening if the phrase is too short
@@ -726,6 +779,7 @@ class Recognizer(AudioSource):
         return stopper
 
     def recognize_sphinx(self, audio_data, language="zh-CN", keyword_entries=None, show_all=False):
+        #TODO:自定义关键词部分
         """
         Performs speech recognition on ``audio_data`` (an ``AudioData`` instance), using CMU Sphinx.
 
@@ -798,7 +852,7 @@ class Recognizer(AudioSource):
         if hypothesis is not None: return hypothesis.hypstr
         raise UnknownValueError()  # no transcriptions available
 
-    def recognize_baidu(self, audio_data, key=None, language="zh-CN", show_all=True):
+    def recognize_baidu(self, audio_data, index,key=None, language="zh-CN", show_all=True):
         """
         百度语音识别API，
         :param audio_data:
@@ -808,12 +862,14 @@ class Recognizer(AudioSource):
         :return:
         """
         #TODO:listen时，百度识别的问题："黑色的天窗"识别不准、长语音不准、静音或音量不大会出现recognition error、说话不能随意只能清楚的发音；解决健壮性的问题
-        #TODO：异步识别
-        #TODO:添加try except
+        #TODO:测试x-flac格式
         assert isinstance(audio_data, AudioData), "Data must be audio data"
 
         import urllib2
         import pycurl
+
+        print '百度内：此次识别开始...'
+        begin_time = time.time()
 
         def get_token():
             apiKey = "0XyzNfIwZeSqDN8oZWR54Qon"
@@ -866,7 +922,10 @@ class Recognizer(AudioSource):
         finally:
             c.close()
 
-        print baidu_text
+        end_time = time.time()
+        recognition_time = end_time-begin_time
+
+        print index,baidu_text,'时间：{:.2f}s'.format(recognition_time)
         # return baidu_text
 
     def recognize_google(self, audio_data, key=None, language="en-US", show_all=False):

@@ -3,6 +3,7 @@ build
 dist
 __pycache__
 *.pyc
+*.wav
 speech_recognition/pocketsphinx-data/fr-FR/
 speech_recognition/pocketsphinx-data/zh-CN/
 fr-FR.zip
