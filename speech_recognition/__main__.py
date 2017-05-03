@@ -2,19 +2,28 @@
 import speech_recognition as sr
 import time
 
+source_flag = 0#0从麦克风读取，1从文件读取
 r = sr.Recognizer()
 m = sr.Microphone()
-# a = sr.AudioFile("/Users/riemann/Documents/riemann/audios/lee_long_test.wav")
+a = sr.AudioFile("/Users/riemann/Documents/riemann/audios/lee_long_test.wav")
+
+if source_flag == 0:
+    s = m
+else:
+    s = a
+
+#TODO:lee1.wav的debug
 #TODO:lee1.wav和lee_long_test.wav的波形分析
 
 try:
     print("A moment of silence, please...")
-    with m as source: r.adjust_for_ambient_noise(source)
-    # with a as source: r.adjust_for_ambient_noise(source)
+    # with m as source: r.adjust_for_ambient_noise(source)
+    with s as source: r.adjust_for_ambient_noise(source)
     print("Set minimum energy threshold to {}".format(r.energy_threshold))
     while True:
         print("Please say something: ")
-        with m as source: audio = r.listen_and_slice_and_recognize(source)
+        with s as source: text_list = r.listen_and_slice_and_recognize(source)
+        print ' '.join(text_list)
         break
 except:
     pass

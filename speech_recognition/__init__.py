@@ -483,15 +483,17 @@ class Recognizer(AudioSource):
         Creates a new ``Recognizer`` instance, which represents a collection of speech recognition functionality.
         """
         self.energy_threshold = 300  # minimum audio energy to consider for recording
-        self.dynamic_energy_threshold = True
+        self.dynamic_energy_threshold = False
         self.dynamic_energy_adjustment_damping = 0.15
         self.dynamic_energy_ratio = 1.5
-        self.pause_threshold = 5  # seconds of non-speaking audio before a phrase is considered complete#根据静音段的时长判断是否已经停止说话。
+        self.pause_threshold = 3  # seconds of non-speaking audio before a phrase is considered complete#根据静音段的时长判断是否已经停止说话。
         self.slice_threshold = 0.6#中间切分处的静音时长阈值
         self.operation_timeout = None  # seconds after an internal operation (e.g., an API request) starts before it times out, or ``None`` for no timeout
 
         self.phrase_threshold = 0.3  # minimum seconds of speaking audio before we consider the speaking audio a phrase - values below this are ignored (for filtering out clicks and pops)
         self.non_speaking_duration = 0.5  # seconds of non-speaking audio to keep on both sides of the recording
+
+        self.text_dict = {0:'000初始化文本字典'}
 
     def record(self, source, duration=None, offset=None):
         """
@@ -547,11 +549,14 @@ class Recognizer(AudioSource):
             if elapsed_time > duration: break
             buffer = source.stream.read(source.CHUNK)
             energy = audioop.rms(buffer, source.SAMPLE_WIDTH)  # energy of the audio signal
+            print '能量%s'% energy
 
             # dynamically adjust the energy threshold using asymmetric weighted average
             damping = self.dynamic_energy_adjustment_damping ** seconds_per_buffer  # account for different chunk sizes and rates
             target_energy = energy * self.dynamic_energy_ratio
             self.energy_threshold = self.energy_threshold * damping + target_energy * (1 - damping)
+            print '能量阈值%s'% self.energy_threshold
+        self.energy_threshold = self.energy_threshold + 500  # +500人工加高阈值以防止对噪音太过敏感。高噪环境应较高，安静环境应较低。
 
     def listen(self, source, timeout=None, phrase_time_limit=None):
         """
@@ -692,6 +697,7 @@ class Recognizer(AudioSource):
         phrase_start_time = elapsed_time
         sent_flag = False #标识一段数据是否已经被发送识别
         wavname_index = 0
+        thread_arr = []
         while True:
             # handle phrase being too long by cutting off the audio
             elapsed_time += seconds_per_buffer
@@ -704,18 +710,21 @@ class Recognizer(AudioSource):
             phrase_count += 1
 
             # check if speaking has stopped for longer than the pause threshold on the audio input
-            energy = audioop.rms(buffer, source.SAMPLE_WIDTH)  # unit energy of the audio signal within the buffer
+            energy = audioop.rms(buffer, source.SAMPLE_WIDTH)  # unit energy张凯丽 of the audio signal within the buffer
             if energy > self.energy_threshold:
                 pause_count = 0#一旦出现语音随即重新归零
                 sent_flag = False
             else:
                 pause_count += 1
                 pause_count_this_time += 1
+                # print pause_count,slice_buffer_count
 
             #TODO：通过麦克风录入识别不准的原因：1.信噪比低。说话声音小，环境噪音较大。在遇到都是噪音的嘈杂片段时，就会返回3301:recognition error.2.吐词不清晰
+            #TODO:会丢失部分开头处语音对应的文字
             if pause_count > slice_buffer_count and not sent_flag and (phrase_count - pause_count_this_time >= phrase_buffer_count):  # end of the phrase#静音足够长，认为不再说话，并且此部分数据并未被发送识别
                 # for i in range( pause_count - non_speaking_buffer_count): frames.pop()  # remove extra non-speaking frames at the end
                 print '———————{}———————'.format(wavname_index)
+                # print '{}'.format(wavname_index)
 
                 frame_data = b"".join(list(frames))
                 wavname = str(wavname_index)+'.wav'
@@ -725,7 +734,7 @@ class Recognizer(AudioSource):
                 f.setsampwidth(2)
                 f.writeframes(frame_data)
                 recognize_thread = threading.Thread(target=self.recognize_baidu,args=(AudioData(frame_data, source.SAMPLE_RATE, source.SAMPLE_WIDTH),wavname_index,))
-                # recognize_thread.daemon = True
+                thread_arr.append(recognize_thread)
                 recognize_thread.start()
                 sent_flag = True
                 frames = collections.deque()
@@ -736,6 +745,9 @@ class Recognizer(AudioSource):
             if pause_count > pause_buffer_count:
                 print pause_count, "结束识别",pause_buffer_count
                 break
+        for i in thread_arr:
+            i.join()
+        return [self.text_dict[i] for i in sorted(self.text_dict.keys())]
 
 
             # check how long the detected phrase is, and retry listening if the phrase is too short
@@ -868,7 +880,6 @@ class Recognizer(AudioSource):
         import urllib2
         import pycurl
 
-        print '百度内：此次识别开始...'
         begin_time = time.time()
 
         def get_token():
@@ -880,17 +891,18 @@ class Recognizer(AudioSource):
 
             res = urllib2.urlopen(auth_url)
             json_data = res.read()
+            print json.loads(json_data)['access_token']
             return json.loads(json_data)['access_token']
 
-        global baidu_text
         def dump_res(buf):
-            global baidu_text
             a = eval(buf)
             if a['err_msg'] == 'success.':
                 # print a['result'][0]#终于搞定了，在这里可以输出，返回的语句
-                baidu_text = a['result'][0]
+                self.text_dict[index] = a['result'][0]
             else:
-                baidu_text = a['err_msg'] if not show_all else a
+                err_information = a['err_msg'] if not show_all else a
+                print index,err_information
+                self.text_dict[index] = '||'
 
         wav_data = audio_data.get_wav_data(
             convert_rate=16000,  # audio samples must be at least 8 kHz
@@ -922,11 +934,10 @@ class Recognizer(AudioSource):
         finally:
             c.close()
 
+
         end_time = time.time()
         recognition_time = end_time-begin_time
-
-        print index,baidu_text,'时间：{:.2f}s'.format(recognition_time)
-        # return baidu_text
+        print index,self.text_dict[index],'时间：{:.2f}s'.format(recognition_time)
 
     def recognize_google(self, audio_data, key=None, language="en-US", show_all=False):
         """
